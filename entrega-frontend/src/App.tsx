@@ -2,22 +2,40 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
   Search, MapPin, ShoppingBag, Home, ClipboardList, UserRound, Plus, Minus, X, Clock3, Star,
-  ArrowRight, ArrowLeft, Store as StoreIcon, Bike, CheckCircle2, ChevronDown,
+  ArrowRight, ArrowLeft, Store as StoreIcon, Bike, CheckCircle2, ChevronDown, LogOut,
   UtensilsCrossed, ShoppingBasket, Pill, Coffee, CupSoda, PawPrint, CakeSlice,
 } from 'lucide-react';
+import AuthScreen from './AuthScreen';
+import type { AuthMode } from './AuthScreen';
 
 type Category = { id: number; name: string; emoji: string };
 type Store = { id: number; name: string; description: string; imageUrl: string; deliveryFee: number; deliveryMinutes: number; rating: number; categoryId: number; categoryName: string };
 type Product = { id: number; name: string; description: string; price: number; imageUrl: string; stock: number; storeId: number; storeName: string };
 type CartLine = { product: Product; quantity: number };
 type Order = { id: number; total: number; status: string; createdAt: string; items: { productName: string; quantity: number }[] };
+type AuthUser = { token: string; name: string; email: string };
 type Tab = 'home' | 'orders' | 'profile';
 type StoreFilter = 'all' | 'free' | 'rating' | 'fast';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8080/api';
+const SESSION_KEY = 'entregaja.session';
+const GUEST_KEY = 'entregaja.guest';
 const money = (n: number) => n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const scrollToTop = () => window.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+
+function readSession(): AuthUser | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const session = JSON.parse(raw) as Partial<AuthUser>;
+    return session.token && session.email && session.name
+      ? { token: session.token, name: session.name, email: session.email }
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 const fallbackCategories: Category[] = [
   { id: 1, name: 'Restaurantes', emoji: '🍔' },
@@ -49,14 +67,28 @@ function EmptyState({ icon: Icon, title, description }: { icon: LucideIcon; titl
   );
 }
 
+class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const r = await fetch(`${API}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
-    ...options,
-  });
+  let r: Response;
+  try {
+    r = await fetch(`${API}${path}`, {
+      headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
+      ...options,
+    });
+  } catch {
+    throw new ApiError('Não foi possível conectar à API.', 0);
+  }
   if (!r.ok) {
     const body = await r.json().catch(() => ({ message: 'Não foi possível concluir a solicitação.' }));
-    throw new Error(body.detail || body.message || 'Erro na API');
+    throw new ApiError(body.detail || body.message || 'Erro na API', r.status);
   }
   return r.json();
 }
@@ -74,8 +106,10 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('home');
   const [cartOpen, setCartOpen] = useState(false);
   const [checkoutOpen, setCheckoutOpen] = useState(false);
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
+  const [user, setUser] = useState<AuthUser | null>(() => readSession());
+  const [guest, setGuest] = useState(() => sessionStorage.getItem(GUEST_KEY) === '1');
+  const [name, setName] = useState(() => readSession()?.name ?? '');
+  const [email, setEmail] = useState(() => readSession()?.email ?? '');
   const [address, setAddress] = useState('');
   const [orders, setOrders] = useState<Order[]>([]);
   const [notice, setNotice] = useState('');
@@ -100,6 +134,30 @@ export default function App() {
   }
 
   useEffect(() => { void load(); }, []);
+
+  useEffect(() => {
+    if (!user?.token) return;
+    let active = true;
+    request<{ name: string; email: string }>('/auth/me', {
+      headers: { Authorization: `Bearer ${user.token}` },
+    })
+      .then((profile) => {
+        if (!active) return;
+        setUser((current) => (current ? { ...current, name: profile.name, email: profile.email } : current));
+        setName(profile.name);
+        setEmail(profile.email);
+      })
+      .catch((error) => {
+        if (!active) return;
+        if (error instanceof ApiError && error.status === 401) {
+          localStorage.removeItem(SESSION_KEY);
+          setUser(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!added) return;
@@ -241,6 +299,62 @@ export default function App() {
     }
   }
 
+  async function authenticate(mode: AuthMode, data: { name?: string; email: string; password: string }) {
+    const auth = await request<AuthUser>(`/auth/${mode}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+    localStorage.setItem(SESSION_KEY, JSON.stringify(auth));
+    sessionStorage.removeItem(GUEST_KEY);
+    setUser(auth);
+    setGuest(false);
+    setName(auth.name);
+    setEmail(auth.email);
+    setTab('home');
+    setSelectedStore(null);
+    scrollToTop();
+  }
+
+  function continueAsGuest() {
+    sessionStorage.setItem(GUEST_KEY, '1');
+    setGuest(true);
+  }
+
+  function openAuth() {
+    sessionStorage.removeItem(GUEST_KEY);
+    setGuest(false);
+  }
+
+  function signOut() {
+    localStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(GUEST_KEY);
+    setUser(null);
+    setGuest(false);
+    setName('');
+    setEmail('');
+    setAddress('');
+    setOrders([]);
+    setCart([]);
+    setTab('home');
+    setSelectedStore(null);
+    setCartOpen(false);
+    setCheckoutOpen(false);
+    scrollToTop();
+  }
+
+  function saveProfile() {
+    if (!name.trim() || !email.trim()) {
+      setNotice('Preencha nome e e-mail.');
+      return;
+    }
+    if (user) {
+      const next = { ...user, name: name.trim(), email: email.trim() };
+      setUser(next);
+      localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+    }
+    setNotice('Dados atualizados.');
+  }
+
   function statusTone(status: string) {
     if (/entregue|conclu|delivered/i.test(status)) return 'done';
     if (/cancel/i.test(status)) return 'cancel';
@@ -263,6 +377,10 @@ export default function App() {
       CANCELED: 'Cancelado',
     };
     return labels[key] || status;
+  }
+
+  if (!user && !guest) {
+    return <AuthScreen onAuthenticate={authenticate} onGuest={continueAsGuest} />;
   }
 
   return (
@@ -579,9 +697,33 @@ export default function App() {
                 <p>Dados usados na entrega e no histórico de pedidos.</p>
               </div>
 
+              {user ? (
+                <div className="account-card">
+                  <span className="avatar" aria-hidden="true">{user.name.charAt(0).toUpperCase()}</span>
+                  <div className="account-copy">
+                    <strong>{user.name}</strong>
+                    <span>{user.email}</span>
+                  </div>
+                  <button type="button" className="ghost-btn small" onClick={signOut}>
+                    <LogOut size={15} /> Sair
+                  </button>
+                </div>
+              ) : (
+                <div className="account-card">
+                  <span className="avatar guest" aria-hidden="true"><UserRound size={18} /></span>
+                  <div className="account-copy">
+                    <strong>Visitante</strong>
+                    <span>Entre na sua conta.</span>
+                  </div>
+                  <button type="button" className="ghost-btn small" onClick={openAuth}>
+                    Entrar
+                  </button>
+                </div>
+              )}
+
               <form
                 className="panel-form"
-                onSubmit={(e) => { e.preventDefault(); setNotice('Dados atualizados.'); }}
+                onSubmit={(e) => { e.preventDefault(); saveProfile(); }}
               >
                 <label>
                   Nome
